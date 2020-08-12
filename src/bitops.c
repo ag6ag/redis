@@ -104,6 +104,7 @@ long redisBitpos(void *s, unsigned long count, int bit) {
     unsigned long skipval, word = 0, one;
     long pos = 0; /* Position of bit, to return to the caller. */
     unsigned long j;
+    int found;
 
     /* Process whole words first, seeking for first word that is not
      * all ones or all zeros respectively if we are lookig for zeros
@@ -117,21 +118,27 @@ long redisBitpos(void *s, unsigned long count, int bit) {
     /* Skip initial bits not aligned to sizeof(unsigned long) byte by byte. */
     skipval = bit ? 0 : UCHAR_MAX;
     c = (unsigned char*) s;
+    found = 0;
     while((unsigned long)c & (sizeof(*l)-1) && count) {
-        if (*c != skipval) break;
+        if (*c != skipval) {
+            found = 1;
+            break;
+        }
         c++;
         count--;
         pos += 8;
     }
 
     /* Skip bits with full word step. */
-    skipval = bit ? 0 : ULONG_MAX;
     l = (unsigned long*) c;
-    while (count >= sizeof(*l)) {
-        if (*l != skipval) break;
-        l++;
-        count -= sizeof(*l);
-        pos += sizeof(*l)*8;
+    if (!found) {
+        skipval = bit ? 0 : ULONG_MAX;
+        while (count >= sizeof(*l)) {
+            if (*l != skipval) break;
+            l++;
+            count -= sizeof(*l);
+            pos += sizeof(*l)*8;
+        }
     }
 
     /* Load bytes into "word" considering the first byte as the most significant
@@ -215,12 +222,7 @@ void setUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint6
 }
 
 void setSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, int64_t value) {
-    uint64_t uv;
-
-    if (value >= 0)
-        uv = value;
-    else
-        uv = UINT64_MAX + value + 1;
+    uint64_t uv = value; /* Casting will add UINT64_MAX + 1 if v is negative. */
     setUnsignedBitfield(p,offset,bits,uv);
 }
 
@@ -239,11 +241,23 @@ uint64_t getUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
 }
 
 int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
-    int64_t value = getUnsignedBitfield(p,offset,bits);
+    int64_t value;
+    union {uint64_t u; int64_t i;} conv;
+
+    /* Converting from unsigned to signed is undefined when the value does
+     * not fit, however here we assume two's complement and the original value
+     * was obtained from signed -> unsigned conversion, so we'll find the
+     * most significant bit set if the original value was negative.
+     *
+     * Note that two's complement is mandatory for exact-width types
+     * according to the C99 standard. */
+    conv.u = getUnsignedBitfield(p,offset,bits);
+    value = conv.i;
+
     /* If the top significant bit is 1, propagate it to all the
-     * higher bits for two complement representation of signed
+     * higher bits for two's complement representation of signed
      * integers. */
-    if (value & ((uint64_t)1 << (bits-1)))
+    if (bits < 64 && (value & ((uint64_t)1 << (bits-1))))
         value |= ((uint64_t)-1) << bits;
     return value;
 }
@@ -255,7 +269,7 @@ int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
  * then zero is returned, otherwise in case of overflow, 1 is returned,
  * otherwise in case of underflow, -1 is returned.
  *
- * When non-zero is returned (oferflow or underflow), if not NULL, *limit is
+ * When non-zero is returned (overflow or underflow), if not NULL, *limit is
  * set to the value the operation should result when an overflow happens,
  * depending on the specified overflow semantics:
  *
@@ -299,7 +313,7 @@ int checkUnsignedBitfieldOverflow(uint64_t value, int64_t incr, uint64_t bits, i
 
 handle_wrap:
     {
-        uint64_t mask = ((int64_t)-1) << bits;
+        uint64_t mask = ((uint64_t)-1) << bits;
         uint64_t res = value+incr;
 
         res &= ~mask;
@@ -342,7 +356,6 @@ int checkSignedBitfieldOverflow(int64_t value, int64_t incr, uint64_t bits, int 
 
 handle_wrap:
     {
-        uint64_t mask = ((int64_t)-1) << bits;
         uint64_t msb = (uint64_t)1 << (bits-1);
         uint64_t a = value, b = incr, c;
         c = a+b; /* Perform addition as unsigned so that's defined. */
@@ -350,10 +363,13 @@ handle_wrap:
         /* If the sign bit is set, propagate to all the higher order
          * bits, to cap the negative value. If it's clear, mask to
          * the positive integer limit. */
-        if (c & msb) {
-            c |= mask;
-        } else {
-            c &= ~mask;
+        if (bits < 64) {
+            uint64_t mask = ((uint64_t)-1) << bits;
+            if (c & msb) {
+                c |= mask;
+            } else {
+                c &= ~mask;
+            }
         }
         *limit = c;
     }
@@ -464,16 +480,47 @@ int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
 robj *lookupStringForBitCommand(client *c, size_t maxbit) {
     size_t byte = maxbit >> 3;
     robj *o = lookupKeyWrite(c->db,c->argv[1]);
+    if (checkType(c,o,OBJ_STRING)) return NULL;
 
     if (o == NULL) {
         o = createObject(OBJ_STRING,sdsnewlen(NULL, byte+1));
         dbAdd(c->db,c->argv[1],o);
     } else {
-        if (checkType(c,o,OBJ_STRING)) return NULL;
         o = dbUnshareStringValue(c->db,c->argv[1],o);
         o->ptr = sdsgrowzero(o->ptr,byte+1);
     }
     return o;
+}
+
+/* Return a pointer to the string object content, and stores its length
+ * in 'len'. The user is required to pass (likely stack allocated) buffer
+ * 'llbuf' of at least LONG_STR_SIZE bytes. Such a buffer is used in the case
+ * the object is integer encoded in order to provide the representation
+ * without usign heap allocation.
+ *
+ * The function returns the pointer to the object array of bytes representing
+ * the string it contains, that may be a pointer to 'llbuf' or to the
+ * internal object representation. As a side effect 'len' is filled with
+ * the length of such buffer.
+ *
+ * If the source object is NULL the function is guaranteed to return NULL
+ * and set 'len' to 0. */
+unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
+    serverAssert(o->type == OBJ_STRING);
+    unsigned char *p = NULL;
+
+    /* Set the 'p' pointer to the string, that can be just a stack allocated
+     * array if our string was integer encoded. */
+    if (o && o->encoding == OBJ_ENCODING_INT) {
+        p = (unsigned char*) llbuf;
+        if (len) *len = ll2string(llbuf,LONG_STR_SIZE,(long)o->ptr);
+    } else if (o) {
+        p = (unsigned char*) o->ptr;
+        if (len) *len = sdslen(o->ptr);
+    } else {
+        if (len) *len = 0;
+    }
+    return p;
 }
 
 /* SETBIT key offset bitvalue */
@@ -509,7 +556,7 @@ void setbitCommand(client *c) {
     byteval &= ~(1 << bit);
     byteval |= ((on & 0x1) << bit);
     ((uint8_t*)o->ptr)[byte] = byteval;
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"setbit",c->argv[1],c->db->id);
     server.dirty++;
     addReply(c, bitval ? shared.cone : shared.czero);
@@ -616,8 +663,11 @@ void bitopCommand(client *c) {
 
         /* Fast path: as far as we have data for all the input bitmaps we
          * can take a fast path that performs much better than the
-         * vanilla algorithm. */
+         * vanilla algorithm. On ARM we skip the fast path since it will
+         * result in GCC compiling the code using multiple-words load/store
+         * operations that are not supported even in ARM >= v6. */
         j = 0;
+        #ifndef USE_ALIGNED_ACCESS
         if (minlen >= sizeof(unsigned long)*4 && numkeys <= 16) {
             unsigned long *lp[16];
             unsigned long *lres = (unsigned long*) res;
@@ -678,6 +728,7 @@ void bitopCommand(client *c) {
                 }
             }
         }
+        #endif
 
         /* j is set to the next byte to process by the previous loop. */
         for (; j < maxlen; j++) {
@@ -705,14 +756,15 @@ void bitopCommand(client *c) {
     /* Store the computed value into the target key */
     if (maxlen) {
         o = createObject(OBJ_STRING,res);
-        setKey(c->db,targetkey,o);
+        setKey(c,c->db,targetkey,o);
         notifyKeyspaceEvent(NOTIFY_STRING,"set",targetkey,c->db->id);
         decrRefCount(o);
+        server.dirty++;
     } else if (dbDelete(c->db,targetkey)) {
-        signalModifiedKey(c->db,targetkey);
+        signalModifiedKey(c,c->db,targetkey);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"del",targetkey,c->db->id);
+        server.dirty++;
     }
-    server.dirty++;
     addReplyLongLong(c,maxlen); /* Return the output string length in bytes. */
 }
 
@@ -721,21 +773,12 @@ void bitcountCommand(client *c) {
     robj *o;
     long start, end, strlen;
     unsigned char *p;
-    char llbuf[32];
+    char llbuf[LONG_STR_SIZE];
 
     /* Lookup, check for type, and return 0 for non existing keys. */
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,o,OBJ_STRING)) return;
-
-    /* Set the 'p' pointer to the string, that can be just a stack allocated
-     * array if our string was integer encoded. */
-    if (o->encoding == OBJ_ENCODING_INT) {
-        p = (unsigned char*) llbuf;
-        strlen = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
-    } else {
-        p = (unsigned char*) o->ptr;
-        strlen = sdslen(o->ptr);
-    }
+    p = getObjectReadOnlyString(o,&strlen,llbuf);
 
     /* Parse start/end range if any. */
     if (c->argc == 4) {
@@ -744,6 +787,10 @@ void bitcountCommand(client *c) {
         if (getLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
             return;
         /* Convert negative indexes */
+        if (start < 0 && end < 0 && start > end) {
+            addReply(c,shared.czero);
+            return;
+        }
         if (start < 0) start = strlen+start;
         if (end < 0) end = strlen+end;
         if (start < 0) start = 0;
@@ -775,7 +822,7 @@ void bitposCommand(client *c) {
     robj *o;
     long bit, start, end, strlen;
     unsigned char *p;
-    char llbuf[32];
+    char llbuf[LONG_STR_SIZE];
     int end_given = 0;
 
     /* Parse the bit argument to understand what we are looking for, set
@@ -795,16 +842,7 @@ void bitposCommand(client *c) {
         return;
     }
     if (checkType(c,o,OBJ_STRING)) return;
-
-    /* Set the 'p' pointer to the string, that can be just a stack allocated
-     * array if our string was integer encoded. */
-    if (o->encoding == OBJ_ENCODING_INT) {
-        p = (unsigned char*) llbuf;
-        strlen = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
-    } else {
-        p = (unsigned char*) o->ptr;
-        strlen = sdslen(o->ptr);
-    }
+    p = getObjectReadOnlyString(o,&strlen,llbuf);
 
     /* Parse start/end range if any. */
     if (c->argc == 4 || c->argc == 5) {
@@ -867,6 +905,9 @@ void bitposCommand(client *c) {
  * OVERFLOW [WRAP|SAT|FAIL]
  */
 
+#define BITFIELD_FLAG_NONE      0
+#define BITFIELD_FLAG_READONLY  (1<<0)
+
 struct bitfieldOp {
     uint64_t offset;    /* Bitfield offset. */
     int64_t i64;        /* Increment amount (INCRBY) or SET value */
@@ -876,12 +917,17 @@ struct bitfieldOp {
     int sign;           /* True if signed, otherwise unsigned op. */
 };
 
-void bitfieldCommand(client *c) {
+/* This implements both the BITFIELD command and the BITFIELD_RO command
+ * when flags is set to BITFIELD_FLAG_READONLY: in this case only the
+ * GET subcommand is allowed, other subcommands will return an error. */
+void bitfieldGeneric(client *c, int flags) {
     robj *o;
     size_t bitoffset;
     int j, numops = 0, changes = 0;
     struct bitfieldOp *ops = NULL; /* Array of ops to execute at end. */
     int owtype = BFOVERFLOW_WRAP; /* Overflow type. */
+    int readonly = 1;
+    size_t highest_write_offset = 0;
 
     for (j = 2; j < c->argc; j++) {
         int remargs = c->argc-j-1; /* Remaining args other than current. */
@@ -929,8 +975,11 @@ void bitfieldCommand(client *c) {
             return;
         }
 
-        /* INCRBY and SET require another argument. */
         if (opcode != BITFIELDOP_GET) {
+            readonly = 0;
+            if (highest_write_offset < bitoffset + bits - 1)
+                highest_write_offset = bitoffset + bits - 1;
+            /* INCRBY and SET require another argument. */
             if (getLongLongFromObjectOrReply(c,c->argv[j+3],&i64,NULL) != C_OK){
                 zfree(ops);
                 return;
@@ -950,7 +999,31 @@ void bitfieldCommand(client *c) {
         j += 3 - (opcode == BITFIELDOP_GET);
     }
 
-    addReplyMultiBulkLen(c,numops);
+    if (readonly) {
+        /* Lookup for read is ok if key doesn't exit, but errors
+         * if it's not a string. */
+        o = lookupKeyRead(c->db,c->argv[1]);
+        if (o != NULL && checkType(c,o,OBJ_STRING)) {
+            zfree(ops);
+            return;
+        }
+    } else {
+        if (flags & BITFIELD_FLAG_READONLY) {
+            zfree(ops);
+            addReplyError(c, "BITFIELD_RO only supports the GET subcommand");
+            return;
+        }
+
+        /* Lookup by making room up to the farest bit reached by
+         * this operation. */
+        if ((o = lookupStringForBitCommand(c,
+            highest_write_offset)) == NULL) {
+            zfree(ops);
+            return;
+        }
+    }
+
+    addReplyArrayLen(c,numops);
 
     /* Actually process the operations. */
     for (j = 0; j < numops; j++) {
@@ -963,11 +1036,6 @@ void bitfieldCommand(client *c) {
             /* SET and INCRBY: We handle both with the same code path
              * for simplicity. SET return value is the previous value so
              * we need fetch & store as well. */
-
-            /* Lookup by making room up to the farest bit reached by
-             * this operation. */
-            if ((o = lookupStringForBitCommand(c,
-                thisop->offset + (thisop->bits-1))) == NULL) return;
 
             /* We need two different but very similar code paths for signed
              * and unsigned operations, since the set of functions to get/set
@@ -1000,7 +1068,7 @@ void bitfieldCommand(client *c) {
                     setSignedBitfield(o->ptr,thisop->offset,
                                       thisop->bits,newval);
                 } else {
-                    addReply(c,shared.nullbulk);
+                    addReplyNull(c);
                 }
             } else {
                 uint64_t oldval, newval, wrapped, retval;
@@ -1029,26 +1097,29 @@ void bitfieldCommand(client *c) {
                     setUnsignedBitfield(o->ptr,thisop->offset,
                                         thisop->bits,newval);
                 } else {
-                    addReply(c,shared.nullbulk);
+                    addReplyNull(c);
                 }
             }
             changes++;
         } else {
             /* GET */
-            o = lookupKeyRead(c->db,c->argv[1]);
-            size_t olen = (o == NULL) ? 0 : sdslen(o->ptr);
             unsigned char buf[9];
+            long strlen = 0;
+            unsigned char *src = NULL;
+            char llbuf[LONG_STR_SIZE];
+
+            if (o != NULL)
+                src = getObjectReadOnlyString(o,&strlen,llbuf);
 
             /* For GET we use a trick: before executing the operation
              * copy up to 9 bytes to a local buffer, so that we can easily
              * execute up to 64 bit operations that are at actual string
              * object boundaries. */
             memset(buf,0,9);
-            unsigned char *src = o ? o->ptr : NULL;
             int i;
             size_t byte = thisop->offset >> 3;
             for (i = 0; i < 9; i++) {
-                if (src == NULL || i+byte >= olen) break;
+                if (src == NULL || i+byte >= (size_t)strlen) break;
                 buf[i] = src[i+byte];
             }
 
@@ -1067,9 +1138,17 @@ void bitfieldCommand(client *c) {
     }
 
     if (changes) {
-        signalModifiedKey(c->db,c->argv[1]);
+        signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING,"setbit",c->argv[1],c->db->id);
         server.dirty += changes;
     }
     zfree(ops);
+}
+
+void bitfieldCommand(client *c) {
+    bitfieldGeneric(c, BITFIELD_FLAG_NONE);
+}
+
+void bitfieldroCommand(client *c) {
+    bitfieldGeneric(c, BITFIELD_FLAG_READONLY);
 }

@@ -6,6 +6,50 @@ start_server {
 } {
     source "tests/unit/type/list-common.tcl"
 
+    test {LPOS basic usage} {
+        r DEL mylist
+        r RPUSH mylist a b c 1 2 3 c c
+        assert {[r LPOS mylist a] == 0}
+        assert {[r LPOS mylist c] == 2}
+    }
+
+    test {LPOS RANK (positive and negative rank) option} {
+        assert {[r LPOS mylist c RANK 1] == 2}
+        assert {[r LPOS mylist c RANK 2] == 6}
+        assert {[r LPOS mylist c RANK 4] eq ""}
+        assert {[r LPOS mylist c RANK -1] == 7}
+        assert {[r LPOS mylist c RANK -2] == 6}
+    }
+
+    test {LPOS COUNT option} {
+        assert {[r LPOS mylist c COUNT 0] == {2 6 7}}
+        assert {[r LPOS mylist c COUNT 1] == {2}}
+        assert {[r LPOS mylist c COUNT 2] == {2 6}}
+        assert {[r LPOS mylist c COUNT 100] == {2 6 7}}
+    }
+
+    test {LPOS COUNT + RANK option} {
+        assert {[r LPOS mylist c COUNT 0 RANK 2] == {6 7}}
+        assert {[r LPOS mylist c COUNT 2 RANK -1] == {7 6}}
+    }
+
+    test {LPOS non existing key} {
+        assert {[r LPOS mylistxxx c COUNT 0 RANK 2] eq {}}
+    }
+
+    test {LPOS no match} {
+        assert {[r LPOS mylist x COUNT 2 RANK -1] eq {}}
+        assert {[r LPOS mylist x RANK -1] eq {}}
+    }
+
+    test {LPOS MAXLEN} {
+        assert {[r LPOS mylist a COUNT 0 MAXLEN 1] == {0}}
+        assert {[r LPOS mylist c COUNT 0 MAXLEN 1] == {}}
+        assert {[r LPOS mylist c COUNT 0 MAXLEN 3] == {2}}
+        assert {[r LPOS mylist c COUNT 0 MAXLEN 3 RANK -1] == {7 6}}
+        assert {[r LPOS mylist c COUNT 0 MAXLEN 7 RANK 2] == {6}}
+    }
+
     test {LPUSH, RPUSH, LLENGTH, LINDEX, LPOP - ziplist} {
         # first lpush then rpush
         assert_equal 1 [r lpush myziplist1 aa]
@@ -436,8 +480,11 @@ start_server {
 
         test "$pop: with non-integer timeout" {
             set rd [redis_deferring_client]
-            $rd $pop blist1 1.1
-            assert_error "ERR*not an integer*" {$rd read}
+            r del blist1
+            $rd $pop blist1 0.1
+            r rpush blist1 foo
+            assert_equal {blist1 foo} [$rd read]
+            assert_equal 0 [r exists blist1]
         }
 
         test "$pop: with zero timeout should block indefinitely" {
@@ -507,7 +554,9 @@ start_server {
             create_list xlist "$large c"
             assert_equal 3 [r rpushx xlist d]
             assert_equal 4 [r lpushx xlist a]
-            assert_equal "a $large c d" [r lrange xlist 0 -1]
+            assert_equal 6 [r rpushx xlist 42 x]
+            assert_equal 9 [r lpushx xlist y3 y2 y1]
+            assert_equal "y1 y2 y3 a $large c d 42 x" [r lrange xlist 0 -1]
         }
 
         test "LINSERT - $type" {

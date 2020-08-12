@@ -287,8 +287,8 @@ int hashTypeDelete(robj *o, sds field) {
         if (fptr != NULL) {
             fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);
             if (fptr != NULL) {
-                zl = ziplistDelete(zl,&fptr);
-                zl = ziplistDelete(zl,&fptr);
+                zl = ziplistDelete(zl,&fptr); /* Delete the key. */
+                zl = ziplistDelete(zl,&fptr); /* Delete the value. */
                 o->ptr = zl;
                 deleted = 1;
             }
@@ -308,13 +308,13 @@ int hashTypeDelete(robj *o, sds field) {
 }
 
 /* Return the number of elements in a hash. */
-unsigned long hashTypeLength(robj *o) {
+unsigned long hashTypeLength(const robj *o) {
     unsigned long length = ULONG_MAX;
 
     if (o->encoding == OBJ_ENCODING_ZIPLIST) {
         length = ziplistLen(o->ptr) / 2;
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        length = dictSize((dict*)o->ptr);
+        length = dictSize((const dict*)o->ptr);
     } else {
         serverPanic("Unknown hash encoding");
     }
@@ -450,14 +450,11 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
 
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
     robj *o = lookupKeyWrite(c->db,key);
+    if (checkType(c,o,OBJ_HASH)) return NULL;
+
     if (o == NULL) {
         o = createHashObject();
         dbAdd(c->db,key,o);
-    } else {
-        if (o->type != OBJ_HASH) {
-            addReply(c,shared.wrongtypeerr);
-            return NULL;
-        }
     }
     return o;
 }
@@ -511,19 +508,6 @@ void hashTypeConvert(robj *o, int enc) {
  * Hash type commands
  *----------------------------------------------------------------------------*/
 
-void hsetCommand(client *c) {
-    int update;
-    robj *o;
-
-    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
-    hashTypeTryConversion(o,c->argv,2,3);
-    update = hashTypeSet(o,c->argv[2]->ptr,c->argv[3]->ptr,HASH_SET_COPY);
-    addReply(c, update ? shared.czero : shared.cone);
-    signalModifiedKey(c->db,c->argv[1]);
-    notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
-    server.dirty++;
-}
-
 void hsetnxCommand(client *c) {
     robj *o;
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
@@ -534,14 +518,14 @@ void hsetnxCommand(client *c) {
     } else {
         hashTypeSet(o,c->argv[2]->ptr,c->argv[3]->ptr,HASH_SET_COPY);
         addReply(c, shared.cone);
-        signalModifiedKey(c->db,c->argv[1]);
+        signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
         server.dirty++;
     }
 }
 
-void hmsetCommand(client *c) {
-    int i;
+void hsetCommand(client *c) {
+    int i, created = 0;
     robj *o;
 
     if ((c->argc % 2) == 1) {
@@ -551,11 +535,20 @@ void hmsetCommand(client *c) {
 
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
     hashTypeTryConversion(o,c->argv,2,c->argc-1);
-    for (i = 2; i < c->argc; i += 2) {
-        hashTypeSet(o,c->argv[i]->ptr,c->argv[i+1]->ptr,HASH_SET_COPY);
+
+    for (i = 2; i < c->argc; i += 2)
+        created += !hashTypeSet(o,c->argv[i]->ptr,c->argv[i+1]->ptr,HASH_SET_COPY);
+
+    /* HMSET (deprecated) and HSET return value is different. */
+    char *cmdname = c->argv[0]->ptr;
+    if (cmdname[1] == 's' || cmdname[1] == 'S') {
+        /* HSET */
+        addReplyLongLong(c, created);
+    } else {
+        /* HMSET */
+        addReply(c, shared.ok);
     }
-    addReply(c, shared.ok);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
     server.dirty++;
 }
@@ -590,7 +583,7 @@ void hincrbyCommand(client *c) {
     new = sdsfromlonglong(value);
     hashTypeSet(o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE);
     addReplyLongLong(c,value);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hincrby",c->argv[1],c->db->id);
     server.dirty++;
 }
@@ -619,13 +612,17 @@ void hincrbyfloatCommand(client *c) {
     }
 
     value += incr;
+    if (isnan(value) || isinf(value)) {
+        addReplyError(c,"increment would produce NaN or Infinity");
+        return;
+    }
 
-    char buf[256];
-    int len = ld2string(buf,sizeof(buf),value,1);
+    char buf[MAX_LONG_DOUBLE_CHARS];
+    int len = ld2string(buf,sizeof(buf),value,LD_STR_HUMAN);
     new = sdsnewlen(buf,len);
     hashTypeSet(o,c->argv[2]->ptr,new,HASH_SET_TAKE_VALUE);
     addReplyBulkCBuffer(c,buf,len);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c,c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_HASH,"hincrbyfloat",c->argv[1],c->db->id);
     server.dirty++;
 
@@ -645,7 +642,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
     int ret;
 
     if (o == NULL) {
-        addReply(c, shared.nullbulk);
+        addReplyNull(c);
         return;
     }
 
@@ -656,7 +653,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
 
         ret = hashTypeGetFromZiplist(o, field, &vstr, &vlen, &vll);
         if (ret < 0) {
-            addReply(c, shared.nullbulk);
+            addReplyNull(c);
         } else {
             if (vstr) {
                 addReplyBulkCBuffer(c, vstr, vlen);
@@ -668,7 +665,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
     } else if (o->encoding == OBJ_ENCODING_HT) {
         sds value = hashTypeGetFromHashTable(o, field);
         if (value == NULL)
-            addReply(c, shared.nullbulk);
+            addReplyNull(c);
         else
             addReplyBulkCBuffer(c, value, sdslen(value));
     } else {
@@ -679,7 +676,7 @@ static void addHashFieldToReply(client *c, robj *o, sds field) {
 void hgetCommand(client *c) {
     robj *o;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL ||
         checkType(c,o,OBJ_HASH)) return;
 
     addHashFieldToReply(c, o, c->argv[2]->ptr);
@@ -692,12 +689,9 @@ void hmgetCommand(client *c) {
     /* Don't abort when the key cannot be found. Non-existing keys are empty
      * hashes, where HMGET should respond with a series of null bulks. */
     o = lookupKeyRead(c->db, c->argv[1]);
-    if (o != NULL && o->type != OBJ_HASH) {
-        addReply(c, shared.wrongtypeerr);
-        return;
-    }
+    if (checkType(c,o,OBJ_HASH)) return;
 
-    addReplyMultiBulkLen(c, c->argc-2);
+    addReplyArrayLen(c, c->argc-2);
     for (i = 2; i < c->argc; i++) {
         addHashFieldToReply(c, o, c->argv[i]->ptr);
     }
@@ -721,7 +715,7 @@ void hdelCommand(client *c) {
         }
     }
     if (deleted) {
-        signalModifiedKey(c->db,c->argv[1]);
+        signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_HASH,"hdel",c->argv[1],c->db->id);
         if (keyremoved)
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],
@@ -770,17 +764,19 @@ static void addHashIteratorCursorToReply(client *c, hashTypeIterator *hi, int wh
 void genericHgetallCommand(client *c, int flags) {
     robj *o;
     hashTypeIterator *hi;
-    int multiplier = 0;
     int length, count = 0;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymultibulk)) == NULL
-        || checkType(c,o,OBJ_HASH)) return;
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptymap[c->resp]))
+        == NULL || checkType(c,o,OBJ_HASH)) return;
 
-    if (flags & OBJ_HASH_KEY) multiplier++;
-    if (flags & OBJ_HASH_VALUE) multiplier++;
-
-    length = hashTypeLength(o) * multiplier;
-    addReplyMultiBulkLen(c, length);
+    /* We return a map if the user requested keys and values, like in the
+     * HGETALL case. Otherwise to use a flat array makes more sense. */
+    length = hashTypeLength(o);
+    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) {
+        addReplyMapLen(c, length);
+    } else {
+        addReplyArrayLen(c, length);
+    }
 
     hi = hashTypeInitIterator(o);
     while (hashTypeNext(hi) != C_ERR) {
@@ -795,6 +791,9 @@ void genericHgetallCommand(client *c, int flags) {
     }
 
     hashTypeReleaseIterator(hi);
+
+    /* Make sure we returned the right number of elements. */
+    if (flags & OBJ_HASH_KEY && flags & OBJ_HASH_VALUE) count /= 2;
     serverAssert(count == length);
 }
 

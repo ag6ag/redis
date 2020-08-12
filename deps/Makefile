@@ -36,15 +36,18 @@ distclean:
 	-(cd hiredis && $(MAKE) clean) > /dev/null || true
 	-(cd linenoise && $(MAKE) clean) > /dev/null || true
 	-(cd lua && $(MAKE) clean) > /dev/null || true
-	-(cd geohash-int && $(MAKE) clean) > /dev/null || true
 	-(cd jemalloc && [ -f Makefile ] && $(MAKE) distclean) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
 
+ifeq ($(BUILD_TLS),yes)
+    HIREDIS_MAKE_FLAGS = USE_SSL=1
+endif
+
 hiredis: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
-	cd hiredis && $(MAKE) static
+	cd hiredis && $(MAKE) static $(HIREDIS_MAKE_FLAGS)
 
 .PHONY: hiredis
 
@@ -78,13 +81,7 @@ JEMALLOC_LDFLAGS= $(LDFLAGS)
 
 jemalloc: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
-	cd jemalloc && ./configure --with-jemalloc-prefix=je_ --enable-cc-silence CFLAGS="$(JEMALLOC_CFLAGS)" LDFLAGS="$(JEMALLOC_LDFLAGS)"
+	cd jemalloc && ./configure --with-version=5.1.0-0-g0 --with-lg-quantum=3 --with-jemalloc-prefix=je_ --enable-cc-silence CFLAGS="$(JEMALLOC_CFLAGS)" LDFLAGS="$(JEMALLOC_LDFLAGS)"
 	cd jemalloc && $(MAKE) CFLAGS="$(JEMALLOC_CFLAGS)" LDFLAGS="$(JEMALLOC_LDFLAGS)" lib/libjemalloc.a
 
 .PHONY: jemalloc
-
-geohash-int: .make-prerequisites
-	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
-	cd geohash-int && $(MAKE)
-
-.PHONY: geohash-int
